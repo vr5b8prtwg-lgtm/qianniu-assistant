@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""常驻面板：输入型号 → 闲鱼搜索 → 询价 → 报价。"""
+"""常驻面板：捕获千牛 → 提取型号 → 闲鱼搜索 → 询价 → 报价。"""
 from __future__ import annotations
 
 import logging
@@ -8,18 +8,38 @@ import time
 import webbrowser
 from typing import Optional
 
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from app.capture.qianniu import QianniuCapture
 from app.extract.extractor import extract_models
 from app.quote import build_inquiry_message, build_quote_message, calculate_quote
 from app.search.goofish import GoofishClient
 
 log = logging.getLogger(__name__)
+
+AUTO_WATCH_INTERVAL_MS = 8000
+
+
+# ---------------------------------------------------------------- 捕获线程
+class CaptureWorker(QThread):
+    finished_ok = Signal(object)  # CaptureResult
+    failed = Signal(str)
+
+    def __init__(self, capturer: QianniuCapture, parent=None):
+        super().__init__(parent)
+        self.capturer = capturer
+
+    def run(self):
+        try:
+            result = self.capturer.capture_current_conversation()
+            self.finished_ok.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 # ---------------------------------------------------------------- 闲鱼线程
@@ -80,14 +100,12 @@ class GoofishThread(QThread):
                 continue
             if action == "__stop__":
                 break
-            # 懒启动：只有用户点“登录/搜索”时才打开浏览器
             if self.client is None and not self._start_client():
                 continue
             try:
                 self._run_action(action, payload)
             except Exception as e:
                 if self._is_closed_error(e):
-                    # 浏览器窗口被关闭：自动重启并重试一次
                     self.error.emit("浏览器窗口被关闭，正在自动重启浏览器并重试…")
                     log.warning("浏览器关闭，重启后重试：%s", e)
                     try:
@@ -116,6 +134,9 @@ class MainPanel(QMainWindow):
         super().__init__()
         self.config = config
         self.store = store
+        self.capturer = QianniuCapture(config, ocr_engine=None)
+        self._lazy_ocr()
+        self.capture_worker: Optional[CaptureWorker] = None
         self.current_model: str = ""
         self.last_result_items: list = []
 
@@ -124,12 +145,12 @@ class MainPanel(QMainWindow):
         self._apply_config_to_ui()
         self._init_goofish_thread()
 
-        self.statusBar().showMessage("就绪：输入型号后点“在闲鱼搜索当前型号”")
+        self.statusBar().showMessage("就绪：点“捕获当前会话”读取千牛聊天，或直接输入型号")
 
     # ---------------- UI 构建 ----------------
     def _build_ui(self):
-        self.setWindowTitle("千牛工作台助手 - 闲鱼搜型号 + 报价")
-        self.resize(860, 620)
+        self.setWindowTitle("千牛工作台助手 - 捕获型号 + 闲鱼搜索 + 报价")
+        self.resize(880, 660)
         tabs = QTabWidget()
         tabs.addTab(self._build_work_tab(), "工作台")
         tabs.addTab(self._build_history_tab(), "历史")
@@ -140,22 +161,42 @@ class MainPanel(QMainWindow):
         w = QWidget()
         root = QVBoxLayout(w)
 
-        # ① 型号
-        model_box = QGroupBox("① 型号")
-        model_layout = QVBoxLayout(model_box)
+        # ① 捕获千牛会话
+        cap_box = QGroupBox("① 捕获千牛会话")
+        cap_layout = QVBoxLayout(cap_box)
         row = QHBoxLayout()
+        self.btn_capture = QPushButton("捕获当前会话 (F8)")
+        self.btn_capture.setMinimumHeight(34)
+        self.chk_autowatch = QCheckBox("自动监听新消息")
+        row.addWidget(self.btn_capture)
+        row.addWidget(self.chk_autowatch)
+        row.addStretch(1)
+        cap_layout.addLayout(row)
+        self.lbl_capture = QLabel("未捕获（需打开千牛工作台并点开客户会话）")
+        self.lbl_capture.setWordWrap(True)
+        cap_layout.addWidget(self.lbl_capture)
+        root.addWidget(cap_box)
+
+        # ② 型号
+        model_box = QGroupBox("② 型号（从聊天/图片提取，或手动输入）")
+        model_layout = QVBoxLayout(model_box)
+        row2 = QHBoxLayout()
         self.edt_model = QLineEdit()
-        self.edt_model.setPlaceholderText("输入客户咨询的型号，例如 Y2S3060-S（可粘贴聊天文字后点右侧提取）")
+        self.edt_model.setPlaceholderText("当前型号，可手动修改或从候选中选择")
+        self.cmb_candidates = QComboBox()
+        self.cmb_candidates.setMinimumWidth(240)
+        self.btn_pick = QPushButton("设为当前型号")
         self.btn_clipboard = QPushButton("从剪贴板提取")
         self.btn_clipboard.setToolTip("读取剪贴板里的文字，自动识别其中的型号并填入")
-        row.addWidget(self.edt_model, 3)
-        row.addWidget(self.btn_clipboard, 1)
-        model_layout.addLayout(row)
-        model_layout.addWidget(QLabel("提示：直接在闲鱼搜索按钮上方的输入框手动输入型号，或复制客户消息后点「从剪贴板提取」"))
+        row2.addWidget(self.edt_model, 3)
+        row2.addWidget(self.cmb_candidates, 2)
+        row2.addWidget(self.btn_pick)
+        row2.addWidget(self.btn_clipboard)
+        model_layout.addLayout(row2)
         root.addWidget(model_box)
 
-        # ② 闲鱼
-        xf_box = QGroupBox("② 闲鱼搜索")
+        # ③ 闲鱼
+        xf_box = QGroupBox("③ 闲鱼搜索")
         xf_layout = QVBoxLayout(xf_box)
         row3 = QHBoxLayout()
         self.btn_login = QPushButton("打开/登录闲鱼")
@@ -189,8 +230,8 @@ class MainPanel(QMainWindow):
         xf_layout.addLayout(row4)
         root.addWidget(xf_box, 3)
 
-        # ③ 报价
-        q_box = QGroupBox("③ 报价（闲鱼成交价 × 倍率）")
+        # ④ 报价
+        q_box = QGroupBox("④ 报价（闲鱼成交价 × 倍率）")
         q_layout = QFormLayout(q_box)
         self.edt_price = QLineEdit()
         self.edt_price.setPlaceholderText("例如 380")
@@ -255,6 +296,10 @@ class MainPanel(QMainWindow):
 
     # ---------------- 信号 ----------------
     def _wire_signals(self):
+        self.btn_capture.clicked.connect(self.on_capture)
+        self.chk_autowatch.toggled.connect(self.on_autowatch_toggled)
+        self.cmb_candidates.currentTextChanged.connect(self.on_candidate_changed)
+        self.btn_pick.clicked.connect(self.on_pick_candidate)
         self.btn_clipboard.clicked.connect(self.on_clipboard_extract)
         self.btn_login.clicked.connect(self.on_login)
         self.btn_search.clicked.connect(self.on_search)
@@ -264,6 +309,11 @@ class MainPanel(QMainWindow):
         self.btn_quote.clicked.connect(self.on_quote)
         self.btn_copy_quote.clicked.connect(self.on_copy_quote)
         self.btn_save_settings.clicked.connect(self.on_save_settings)
+
+        # F8 快捷键
+        from PySide6.QtGui import QShortcut, QKeySequence
+        self._shortcut = QShortcut(QKeySequence("F8"), self)
+        self._shortcut.activated.connect(self.on_capture)
 
     def _apply_config_to_ui(self):
         q = self.config.get("quote", {})
@@ -277,12 +327,25 @@ class MainPanel(QMainWindow):
         self.spin_min_interval.setValue(float(g.get("min_search_interval", 3.0)))
         self.spin_max_interval.setValue(float(g.get("max_search_interval", 6.0)))
         self.chk_topmost.setChecked(bool(self.config.get("ui", {}).get("always_on_top", True)))
+        self.chk_autowatch.setChecked(bool(self.config.get("auto_watch", False)))
         self._apply_topmost()
 
     def _apply_topmost(self):
         flag = Qt.WindowType.WindowStaysOnTopHint if self.chk_topmost.isChecked() else Qt.WindowType.Widget
         self.setWindowFlag(flag, True)
         self.show()
+
+    # ---------------- OCR 惰性注入 ----------------
+    def _lazy_ocr(self):
+        try:
+            from app.capture.ocr import OcrEngine
+            engine = self.config.get("ocr", {}).get("engine", "rapidocr")
+            ocr = OcrEngine(engine)
+            self.capturer.ocr = ocr
+            if not ocr.available:
+                log.warning("OCR 不可用，图片咨询将无法自动识别")
+        except Exception as e:
+            log.warning("OCR 初始化失败：%s", e)
 
     # ---------------- 闲鱼线程 ----------------
     def _init_goofish_thread(self):
@@ -302,12 +365,80 @@ class MainPanel(QMainWindow):
             pass
         super().closeEvent(event)
 
+    # ---------------- 捕获 ----------------
+    def on_capture(self):
+        if self.capture_worker and self.capture_worker.isRunning():
+            return
+        self.lbl_capture.setText("正在读取千牛会话…")
+        self.capture_worker = CaptureWorker(self.capturer)
+        self.capture_worker.finished_ok.connect(self.on_capture_result)
+        self.capture_worker.failed.connect(
+            lambda e: self.lbl_capture.setText(f"捕获失败：{e}"))
+        self.capture_worker.start()
+
+    def on_capture_result(self, result):
+        if result.method == "not_running":
+            self.lbl_capture.setText("未检测到千牛工作台进程，请先打开千牛")
+            return
+        if result.method == "error":
+            self.lbl_capture.setText(f"读取失败：{result.note}")
+            return
+        buyer = result.buyer_nick or "当前会话"
+        self.lbl_capture.setText(
+            f"买家：{buyer}　方式：{'窗口读取' if result.method == 'uia' else '截图OCR'}　"
+            f"消息 {len(result.messages)} 条 / 图片 {len(result.image_texts)} 张\n{result.note}")
+        texts = list(result.messages) + list(result.image_texts)
+        combined = "\n".join(texts)
+        models = extract_models(combined, ocr=(result.method == "ocr"))
+        self._set_candidates(models)
+        if self.store:
+            cid = self.store.ensure_conversation(buyer_nick=buyer)
+            for t in texts:
+                self.store.add_message(cid, "in", t)
+            for m in models[:5]:
+                self.store.add_model(cid, m.model, m.brand, m.source, m.confidence)
+        if not models:
+            self.lbl_capture.setText(self.lbl_capture.text() + "\n未识别到型号，请检查聊天内容或手动输入")
+
+    def _set_candidates(self, models):
+        self.cmb_candidates.clear()
+        if models:
+            for m in models[:10]:
+                label = f"{m.model}（{m.brand or '通用'} {m.confidence:.2f}）"
+                self.cmb_candidates.addItem(label, m.model)
+            self.cmb_candidates.setCurrentIndex(0)
+            self.on_candidate_changed(self.cmb_candidates.currentText())
+        else:
+            self.edt_model.setText("")
+
+    def on_candidate_changed(self, text):
+        if self.cmb_candidates.currentData():
+            self.edt_model.setText(self.cmb_candidates.currentData())
+
+    def on_pick_candidate(self):
+        model = self.edt_model.text().strip()
+        if model:
+            self.current_model = model
+            self._show_status(f"当前型号：{model}")
+        else:
+            QMessageBox.information(self, "提示", "请先输入或选择型号")
+
+    def on_autowatch_toggled(self, checked):
+        self.config["auto_watch"] = checked
+        if checked and not hasattr(self, "_watch_timer"):
+            self._watch_timer = QTimer(self)
+            self._watch_timer.timeout.connect(self.on_capture)
+        if checked:
+            self._watch_timer.start(AUTO_WATCH_INTERVAL_MS)
+        else:
+            self._watch_timer.stop()
+
     # ---------------- 型号输入 ----------------
     def on_clipboard_extract(self):
         text = QApplication.clipboard().text() or ""
         models = extract_models(text)
         if models:
-            self.edt_model.setText(models[0].model)
+            self._set_candidates(models)
             self._show_status(f"已从剪贴板提取型号：{models[0].model}")
         else:
             QMessageBox.information(self, "提示", "剪贴板里没有识别到型号，请手动输入")
@@ -361,7 +492,6 @@ class MainPanel(QMainWindow):
             self.lbl_search.setText(outcome.note)
             self._show_status("无结果")
             return
-        # ok
         self.last_result_items = [l.as_dict() for l in outcome.listings]
         self.tbl_results.setRowCount(0)
         for it in self.last_result_items:
@@ -427,7 +557,6 @@ class MainPanel(QMainWindow):
             self.lbl_search.setText(f"填写失败：{note}")
             self._show_status("填写失败")
         else:
-            # manual：复制到剪贴板，人工粘贴发送
             if message:
                 QApplication.clipboard().setText(message)
             self.lbl_search.setText(note + "（消息已复制到剪贴板，可直接粘贴）")
@@ -508,4 +637,3 @@ class MainPanel(QMainWindow):
     def _show_status(self, msg: str):
         self.statusBar().showMessage(msg)
         log.info(msg)
-
