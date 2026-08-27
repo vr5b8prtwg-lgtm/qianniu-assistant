@@ -28,8 +28,6 @@ def main() -> int:
         import app.extract.extractor
         import app.search.parser
         import app.search.goofish
-        import app.capture.qianniu
-        import app.capture.ocr
         import app.ui.panel
 
     def store_ops():
@@ -62,25 +60,6 @@ def main() -> int:
         items = parse_search_results(f.read_text(encoding="utf-8"))
         assert len(items) == 2
 
-    def ocr_available():
-        from app.capture.ocr import OcrEngine
-        eng = OcrEngine("rapidocr")
-        print(f"    OCR 可用: {eng.available}")
-        if not eng.available:
-            raise RuntimeError("OCR 引擎不可用")
-
-    def qianniu_check():
-        from app.capture.qianniu import QianniuCapture
-        from app.capture.ocr import OcrEngine
-        cap = QianniuCapture({}, ocr_engine=OcrEngine("rapidocr"))
-        running = cap.is_running()
-        print(f"    千牛运行中: {running}")
-        if not running:
-            print("    (跳过捕获测试：未检测到千牛)")
-            return
-        res = cap.capture_current_conversation()
-        print(f"    捕获方式: {res.method}, 消息数: {len(res.messages)}, 备注: {res.note}")
-
     def ui_import_offscreen():
         import os
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -92,8 +71,6 @@ def main() -> int:
     check("报价/询价", quote_ops)
     check("型号提取", extract_ops)
     check("结果解析", parser_ops)
-    check("OCR 引擎", ocr_available)
-    check("千牛捕获", qianniu_check)
     check("UI 导入", ui_import_offscreen)
 
     print()
@@ -103,5 +80,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 

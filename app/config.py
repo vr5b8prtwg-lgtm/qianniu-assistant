@@ -37,17 +37,9 @@ DEFAULTS: Dict[str, Any] = {
     "inquiry": {
         "message_template": "你好，{model}这款还有货吗，价格是多少",
     },
-    "ocr": {
-        "engine": "rapidocr",  # rapidocr | disabled
-    },
-    "qianniu": {
-        "process_names": ["AliWorkbench.exe"],
-        "max_messages": 20,
-    },
     "ui": {
         "always_on_top": True,
     },
-    "auto_watch": False,
 }
 
 
@@ -82,7 +74,6 @@ def save_config(cfg: Dict[str, Any], path: str | os.PathLike | None = None) -> N
     p = Path(path) if path else CONFIG_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 
 
